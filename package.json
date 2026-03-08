@@ -5,11 +5,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/loongphy/codex-auth.git"
+    "url": "https://github.com/Loongphy/codex-auth"
   },
-  "homepage": "https://github.com/loongphy/codex-auth",
+  "homepage": "https://github.com/Loongphy/codex-auth",
   "bugs": {
-    "url": "https://github.com/loongphy/codex-auth/issues"
+    "url": "https://github.com/Loongphy/codex-auth/issues"
   },
   "bin": {
     "codex-auth": "bin/codex-auth.js"
