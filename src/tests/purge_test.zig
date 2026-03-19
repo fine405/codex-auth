@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const registry = @import("../registry.zig");
 
 fn b64url(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -307,7 +308,8 @@ test "Scenario: Given purge import with file when rebuilding then current auth i
     const import_path = try std.fs.path.join(gpa, &[_][]const u8{ codex_home, "imports", "personal.json" });
     defer gpa.free(import_path);
 
-    _ = try registry.purgeRegistryFromImportSource(gpa, codex_home, import_path, "personal");
+    var report = try registry.purgeRegistryFromImportSource(gpa, codex_home, import_path, "personal");
+    defer report.deinit(gpa);
 
     var loaded = try registry.loadRegistry(gpa, codex_home);
     defer loaded.deinit(gpa);
@@ -375,7 +377,8 @@ test "Scenario: Given purge with newer schema registry when rebuilding then auto
     const import_path = try std.fs.path.join(gpa, &[_][]const u8{ codex_home, "imports", "personal.json" });
     defer gpa.free(import_path);
 
-    _ = try registry.purgeRegistryFromImportSource(gpa, codex_home, import_path, "personal");
+    var report = try registry.purgeRegistryFromImportSource(gpa, codex_home, import_path, "personal");
+    defer report.deinit(gpa);
 
     var loaded = try registry.loadRegistry(gpa, codex_home);
     defer loaded.deinit(gpa);
@@ -419,7 +422,8 @@ test "Scenario: Given purge with malformed registry when rebuilding then auto an
     const import_path = try std.fs.path.join(gpa, &[_][]const u8{ codex_home, "imports", "personal.json" });
     defer gpa.free(import_path);
 
-    _ = try registry.purgeRegistryFromImportSource(gpa, codex_home, import_path, "personal");
+    var report = try registry.purgeRegistryFromImportSource(gpa, codex_home, import_path, "personal");
+    defer report.deinit(gpa);
 
     var loaded = try registry.loadRegistry(gpa, codex_home);
     defer loaded.deinit(gpa);
@@ -451,7 +455,8 @@ test "Scenario: Given purge without path when rebuilding then it scans account s
     try tmp.dir.writeFile(.{ .sub_path = "accounts/registry.json", .data = "{\"bad\":\"registry\"}" });
     try tmp.dir.writeFile(.{ .sub_path = "accounts/auth.json.bak.1", .data = "backup" });
 
-    _ = try registry.purgeRegistryFromImportSource(gpa, codex_home, null, null);
+    var report = try registry.purgeRegistryFromImportSource(gpa, codex_home, null, null);
+    defer report.deinit(gpa);
 
     var loaded = try registry.loadRegistry(gpa, codex_home);
     defer loaded.deinit(gpa);
@@ -472,7 +477,8 @@ test "Scenario: Given purge without path and only auth backups when rebuilding t
     defer gpa.free(backup_auth);
     try tmp.dir.writeFile(.{ .sub_path = "accounts/auth.json.bak.20260317-010101", .data = backup_auth });
 
-    _ = try registry.purgeRegistryFromImportSource(gpa, codex_home, null, null);
+    var report = try registry.purgeRegistryFromImportSource(gpa, codex_home, null, null);
+    defer report.deinit(gpa);
 
     var loaded = try registry.loadRegistry(gpa, codex_home);
     defer loaded.deinit(gpa);
@@ -487,6 +493,80 @@ test "Scenario: Given purge without path and only auth backups when rebuilding t
     defer gpa.free(snapshot_path);
     var snapshot = try std.fs.cwd().openFile(snapshot_path, .{});
     snapshot.close();
+}
+
+test "Scenario: Given purge without path and an empty snapshot when rebuilding then it reports malformed json and still imports valid backups" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try tmp.dir.makePath("accounts");
+
+    const backup_auth = try authJsonWithEmailPlan(gpa, "backup-valid@example.com", "team");
+    defer gpa.free(backup_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "accounts/auth.json.bak.20260317-010101", .data = backup_auth });
+    try tmp.dir.writeFile(.{ .sub_path = "accounts/auth.json.bak.20260317-020202", .data = "" });
+
+    var report = try registry.purgeRegistryFromImportSource(gpa, codex_home, null, null);
+    defer report.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), report.imported);
+    try std.testing.expectEqual(@as(usize, 1), report.skipped);
+
+    var found_malformed = false;
+    for (report.events.items) |event| {
+        if (event.outcome != .skipped) continue;
+        if (std.mem.eql(u8, event.label, "auth.json.bak.20260317-020202")) {
+            found_malformed = std.mem.eql(u8, event.reason.?, "MalformedJson");
+            break;
+        }
+    }
+    try std.testing.expect(found_malformed);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, "backup-valid@example.com"));
+}
+
+test "Scenario: Given purge without path and a broken snapshot symlink when rebuilding then it skips that entry and still imports valid backups" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try tmp.dir.makePath("accounts");
+
+    const backup_auth = try authJsonWithEmailPlan(gpa, "backup-symlink@example.com", "team");
+    defer gpa.free(backup_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "accounts/auth.json.bak.20260317-010101", .data = backup_auth });
+    try tmp.dir.symLink("missing.auth.json", "accounts/auth.json.bak.20260317-020202", .{});
+
+    var report = try registry.purgeRegistryFromImportSource(gpa, codex_home, null, null);
+    defer report.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), report.imported);
+    try std.testing.expectEqual(@as(usize, 1), report.skipped);
+
+    var found_missing = false;
+    for (report.events.items) |event| {
+        if (event.outcome != .skipped) continue;
+        if (std.mem.eql(u8, event.label, "auth.json.bak.20260317-020202")) {
+            found_missing = std.mem.eql(u8, event.reason.?, "FileNotFound");
+            break;
+        }
+    }
+    try std.testing.expect(found_missing);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, "backup-symlink@example.com"));
 }
 
 test "Scenario: Given purge without path and duplicate snapshots when rebuilding then newest snapshot wins and accounts are sorted by email" {
@@ -518,7 +598,8 @@ test "Scenario: Given purge without path and duplicate snapshots when rebuilding
     defer gpa.free(alpha_auth);
     try tmp.dir.writeFile(.{ .sub_path = "accounts/auth.json.bak.20260317-020202", .data = alpha_auth });
 
-    _ = try registry.purgeRegistryFromImportSource(gpa, codex_home, null, null);
+    var report = try registry.purgeRegistryFromImportSource(gpa, codex_home, null, null);
+    defer report.deinit(gpa);
 
     var loaded = try registry.loadRegistry(gpa, codex_home);
     defer loaded.deinit(gpa);
@@ -567,7 +648,8 @@ test "Scenario: Given same team account id across different users when purging t
     defer gpa.free(second_auth);
     try tmp.dir.writeFile(.{ .sub_path = "accounts/auth.json.bak.20260317-171806", .data = second_auth });
 
-    _ = try registry.purgeRegistryFromImportSource(gpa, codex_home, null, null);
+    var report = try registry.purgeRegistryFromImportSource(gpa, codex_home, null, null);
+    defer report.deinit(gpa);
 
     var loaded = try registry.loadRegistry(gpa, codex_home);
     defer loaded.deinit(gpa);
@@ -620,7 +702,8 @@ test "Scenario: Given same user across team and free workspaces when purging the
     defer gpa.free(free_auth);
     try tmp.dir.writeFile(.{ .sub_path = "accounts/auth.json.bak.20260317-172239", .data = free_auth });
 
-    _ = try registry.purgeRegistryFromImportSource(gpa, codex_home, null, null);
+    var report = try registry.purgeRegistryFromImportSource(gpa, codex_home, null, null);
+    defer report.deinit(gpa);
 
     var loaded = try registry.loadRegistry(gpa, codex_home);
     defer loaded.deinit(gpa);
@@ -655,7 +738,8 @@ test "Scenario: Given purge without accounts directory when rebuilding then curr
     defer gpa.free(active_auth);
     try tmp.dir.writeFile(.{ .sub_path = "auth.json", .data = active_auth });
 
-    _ = try registry.purgeRegistryFromImportSource(gpa, codex_home, null, null);
+    var report = try registry.purgeRegistryFromImportSource(gpa, codex_home, null, null);
+    defer report.deinit(gpa);
 
     var loaded = try registry.loadRegistry(gpa, codex_home);
     defer loaded.deinit(gpa);

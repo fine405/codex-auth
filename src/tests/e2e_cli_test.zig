@@ -88,6 +88,13 @@ fn expectSuccess(result: std.process.Child.RunResult) !void {
     }
 }
 
+fn expectFailure(result: std.process.Child.RunResult) !void {
+    switch (result.term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 fn expectUsageApiWarningOnStderrOnly(result: std.process.Child.RunResult) !void {
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Warning: Usage refresh is currently using the ChatGPT usage API") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "`codex-auth config api disable`") != null);
@@ -233,6 +240,240 @@ test "Scenario: Given upgrade from v0.1.x to v0.2 with legacy accounts data when
     var migrated = try std.fs.cwd().openFile(migrated_path, .{});
     migrated.close();
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(legacy_rel, .{}));
+}
+
+test "Scenario: Given repeated single-file import when running import then first import reports imported and second reports updated" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath("imports");
+
+    const rel_path = "imports/token_ryan.taylor.alpha@email.com.json";
+    const auth_json = try bdd.authJsonWithEmailPlan(gpa, "ryan.taylor.alpha@email.com", "plus");
+    defer gpa.free(auth_json);
+    try tmp.dir.writeFile(.{ .sub_path = rel_path, .data = auth_json });
+
+    const import_path = try std.fs.path.join(gpa, &[_][]const u8{ home_root, rel_path });
+    defer gpa.free(import_path);
+
+    const first = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", import_path });
+    defer gpa.free(first.stdout);
+    defer gpa.free(first.stderr);
+    try expectSuccess(first);
+    try std.testing.expectEqualStrings("  ✓ imported  token_ryan.taylor.alpha@email.com\n", first.stdout);
+    try std.testing.expectEqualStrings("", first.stderr);
+
+    const second = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", import_path });
+    defer gpa.free(second.stdout);
+    defer gpa.free(second.stderr);
+    try expectSuccess(second);
+    try std.testing.expectEqualStrings("  ✓ updated   token_ryan.taylor.alpha@email.com\n", second.stdout);
+    try std.testing.expectEqualStrings("", second.stderr);
+}
+
+test "Scenario: Given single-file import missing email when running import then it exits non-zero after reporting the skipped file" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath("imports");
+
+    const rel_path = "imports/token_bob.wilson.alpha@email.com.json";
+    const auth_json = try bdd.authJsonWithoutEmail(gpa);
+    defer gpa.free(auth_json);
+    try tmp.dir.writeFile(.{ .sub_path = rel_path, .data = auth_json });
+
+    const import_path = try std.fs.path.join(gpa, &[_][]const u8{ home_root, rel_path });
+    defer gpa.free(import_path);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", import_path });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("Import Summary: 0 imported, 1 skipped\n", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "  ✗ skipped   token_bob.wilson.alpha@email.com: MissingEmail\n") != null);
+}
+
+test "Scenario: Given directory import with new updated and invalid files when running import then stdout and stderr split the report" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath("imports");
+
+    const existing_rel = "imports/token_jane.smith.alpha@email.com.json";
+    const existing_auth = try bdd.authJsonWithEmailPlan(gpa, "jane.smith.alpha@email.com", "team");
+    defer gpa.free(existing_auth);
+    try tmp.dir.writeFile(.{ .sub_path = existing_rel, .data = existing_auth });
+
+    const existing_path = try std.fs.path.join(gpa, &[_][]const u8{ home_root, existing_rel });
+    defer gpa.free(existing_path);
+
+    const seed_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", existing_path });
+    defer gpa.free(seed_result.stdout);
+    defer gpa.free(seed_result.stderr);
+    try expectSuccess(seed_result);
+
+    const ryan_auth = try bdd.authJsonWithEmailPlan(gpa, "ryan.taylor.alpha@email.com", "plus");
+    defer gpa.free(ryan_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/token_ryan.taylor.alpha@email.com.json", .data = ryan_auth });
+
+    const john_auth = try bdd.authJsonWithEmailPlan(gpa, "john.doe.alpha@email.com", "pro");
+    defer gpa.free(john_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/token_john.doe.alpha@email.com.json", .data = john_auth });
+
+    const extra_auth = try bdd.authJsonWithEmailPlan(gpa, "mike.roe.alpha@email.com", "business");
+    defer gpa.free(extra_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/token_mike.roe.alpha@email.com.json", .data = extra_auth });
+
+    const missing_email = try bdd.authJsonWithoutEmail(gpa);
+    defer gpa.free(missing_email);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/token_bob.wilson.alpha@email.com.json", .data = missing_email });
+
+    const missing_user_id =
+        "{\"tokens\":{\"access_token\":\"access-missing-user\",\"account_id\":\"67000000-0000-4000-8000-000000000001\",\"id_token\":\"eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6ImFsaWNlLmJyb3duLmFscGhhQGVtYWlsLmNvbSIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X2FjY291bnRfaWQiOiI2NzAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJjaGF0Z3B0X3BsYW5fdHlwZSI6InBybyJ9fQ.sig\"}}";
+    try tmp.dir.writeFile(.{ .sub_path = "imports/token_alice.brown.alpha@email.com.json", .data = missing_user_id });
+
+    try tmp.dir.writeFile(.{ .sub_path = "imports/token_invalid.json", .data = "{not-json}" });
+
+    const imports_path = try std.fs.path.join(gpa, &[_][]const u8{ home_root, "imports" });
+    defer gpa.free(imports_path);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", imports_path });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    const expected_stdout = try std.fmt.allocPrint(
+        gpa,
+        "Scanning {s}...\n" ++
+            "  ✓ updated   token_jane.smith.alpha@email.com\n" ++
+            "  ✓ imported  token_john.doe.alpha@email.com\n" ++
+            "  ✓ imported  token_mike.roe.alpha@email.com\n" ++
+            "  ✓ imported  token_ryan.taylor.alpha@email.com\n" ++
+            "Import Summary: 3 imported, 1 updated, 3 skipped (total 7 files)\n",
+        .{imports_path},
+    );
+    defer gpa.free(expected_stdout);
+    try std.testing.expectEqualStrings(expected_stdout, result.stdout);
+    try std.testing.expectEqualStrings(
+        "  ✗ skipped   token_alice.brown.alpha@email.com: MissingChatgptUserId\n" ++
+            "  ✗ skipped   token_bob.wilson.alpha@email.com: MissingEmail\n" ++
+            "  ✗ skipped   token_invalid: MalformedJson\n",
+        result.stderr,
+    );
+}
+
+test "Scenario: Given directory import with an empty json file when running import then it is skipped as malformed and valid imports still persist" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath("imports");
+
+    const valid_auth = try bdd.authJsonWithEmailPlan(gpa, "still-imported@example.com", "plus");
+    defer gpa.free(valid_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/valid.json", .data = valid_auth });
+    try tmp.dir.writeFile(.{ .sub_path = "imports/empty.json", .data = "" });
+
+    const imports_path = try std.fs.path.join(gpa, &[_][]const u8{ home_root, "imports" });
+    defer gpa.free(imports_path);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", imports_path });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    const expected_stdout = try std.fmt.allocPrint(
+        gpa,
+        "Scanning {s}...\n" ++
+            "  ✓ imported  valid\n" ++
+            "Import Summary: 1 imported, 0 updated, 1 skipped (total 2 files)\n",
+        .{imports_path},
+    );
+    defer gpa.free(expected_stdout);
+    try std.testing.expectEqualStrings(expected_stdout, result.stdout);
+    try std.testing.expectEqualStrings("  ✗ skipped   empty: MalformedJson\n", result.stderr);
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, "still-imported@example.com"));
+}
+
+test "Scenario: Given directory import with a broken symlink when running import then it skips that entry and still imports valid files" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath("imports");
+
+    const valid_auth = try bdd.authJsonWithEmailPlan(gpa, "symlink-survivor@example.com", "plus");
+    defer gpa.free(valid_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/valid.json", .data = valid_auth });
+    try tmp.dir.symLink("missing.json", "imports/broken.json", .{});
+
+    const imports_path = try std.fs.path.join(gpa, &[_][]const u8{ home_root, "imports" });
+    defer gpa.free(imports_path);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", imports_path });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    const expected_stdout = try std.fmt.allocPrint(
+        gpa,
+        "Scanning {s}...\n" ++
+            "  ✓ imported  valid\n" ++
+            "Import Summary: 1 imported, 0 updated, 1 skipped (total 2 files)\n",
+        .{imports_path},
+    );
+    defer gpa.free(expected_stdout);
+    try std.testing.expectEqualStrings(expected_stdout, result.stdout);
+    try std.testing.expectEqualStrings("  ✗ skipped   broken: FileNotFound\n", result.stderr);
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, "symlink-survivor@example.com"));
 }
 
 test "Scenario: Given default api usage when rendering help then warning stays on stderr" {
