@@ -4,8 +4,21 @@ zig-out/
 dist/
 *.tgz
 
+# Swift / macOS app build artifacts
+macos/.build/
+macos/*.app
+
 # IDE/Editor
 .idea/
+.vscode/
+*.xcuserdata/
+.swiftpm/
+
+# macOS system files
+.DS_Store
 
 # Local benchmarking workspace
 benchmark/
+
+# Task tracking (local only)
+tasks/
